@@ -20,6 +20,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import cv2
+import numpy as np
 import torch
 
 from lerobot.configs.types import PolicyFeature
@@ -48,6 +50,112 @@ LeRobotObservation = dict[str, torch.Tensor]
 
 # observation, ready for policy inference (image keys resized)
 Observation = dict[str, torch.Tensor]
+
+
+@dataclass
+class CompressedImage:
+    """A JPEG-encoded image placeholder that survives pickle.
+
+    Client encodes the raw camera frame into JPEG bytes (optionally resized to
+    policy input shape) before sending. Server decodes it back to a numpy
+    (H, W, C) uint8 RGB array so the rest of the pipeline is unchanged.
+    """
+
+    data: bytes
+    height: int
+    width: int
+    channels: int = 3
+    encoding: str = "jpeg"
+
+
+def encode_image_for_transport(
+    image: np.ndarray | torch.Tensor,
+    target_hw: tuple[int, int] | None,
+    quality: int = 90,
+) -> CompressedImage:
+    """Resize (optional) and JPEG-encode a single camera frame.
+
+    Args:
+        image: (H, W, C) uint8 array/tensor in RGB order, as produced by the robot.
+        target_hw: optional (H, W) to resize to before encoding. If None, keep native.
+        quality: JPEG quality 1-100.
+    """
+    if isinstance(image, torch.Tensor):
+        image = image.detach().cpu().numpy()
+
+    if image.dtype != np.uint8:
+        image = image.astype(np.uint8)
+
+    if image.ndim != 3 or image.shape[2] != 3:
+        raise ValueError(f"Expected (H, W, 3) image, got shape {image.shape}")
+
+    if target_hw is not None and (image.shape[0], image.shape[1]) != target_hw:
+        # cv2.resize takes (W, H)
+        image = cv2.resize(image, (target_hw[1], target_hw[0]), interpolation=cv2.INTER_AREA)
+
+    # Robot frames come in RGB; cv2 encodes BGR. Convert before encode so that
+    # cv2.imdecode on the server round-trips back to RGB.
+    bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+    ok, buf = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)])
+    if not ok:
+        raise RuntimeError("cv2.imencode failed to encode frame as JPEG")
+
+    return CompressedImage(
+        data=buf.tobytes(),
+        height=image.shape[0],
+        width=image.shape[1],
+        channels=image.shape[2],
+        encoding="jpeg",
+    )
+
+
+def decode_compressed_image(compressed: CompressedImage) -> np.ndarray:
+    """Decode a CompressedImage back to a (H, W, C) uint8 RGB numpy array."""
+    if compressed.encoding != "jpeg":
+        raise ValueError(f"Unsupported encoding: {compressed.encoding}")
+
+    arr = np.frombuffer(compressed.data, dtype=np.uint8)
+    bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if bgr is None:
+        raise RuntimeError("cv2.imdecode failed to decode CompressedImage")
+
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    return rgb
+
+
+def compress_observation_images(
+    raw_observation: RawObservation,
+    image_keys,
+    target_hw: tuple[int, int] | None,
+    quality: int = 90,
+) -> RawObservation:
+    """Return a shallow-copied observation dict with image values replaced by
+    CompressedImage. Non-image keys (state, task, etc.) are passed through.
+
+    `image_keys` is an iterable of raw robot observation keys (e.g. {"camera1",
+    "camera2"}) whose values are numpy RGB frames.
+    """
+    image_keys = set(image_keys)
+    out: RawObservation = {}
+    for k, v in raw_observation.items():
+        if k in image_keys:
+            out[k] = encode_image_for_transport(v, target_hw=target_hw, quality=quality)
+        else:
+            out[k] = v
+    return out
+
+
+def decompress_observation_images(raw_observation: RawObservation) -> RawObservation:
+    """Replace any CompressedImage value with a numpy (H, W, C) uint8 RGB array
+    so downstream processors behave as if the frame had been transmitted raw.
+    """
+    out: RawObservation = {}
+    for k, v in raw_observation.items():
+        if isinstance(v, CompressedImage):
+            out[k] = decode_compressed_image(v)
+        else:
+            out[k] = v
+    return out
 
 
 def visualize_action_queue_size(action_queue_size: list[int]) -> None:

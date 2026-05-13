@@ -55,6 +55,7 @@ from .helpers import (
     RemotePolicyConfig,
     TimedAction,
     TimedObservation,
+    decompress_observation_images,
     get_logger,
     observations_similar,
     raw_observation_to_observation,
@@ -181,6 +182,14 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             request_iterator, None, self.shutdown_event, self.logger
         )  # blocking call while looping over request_iterator
         timed_observation = pickle.loads(received_bytes)  # nosec
+
+        # Transparently decode any JPEG-compressed camera frames back to
+        # (H, W, C) uint8 RGB numpy arrays so the rest of the pipeline
+        # (raw_observation_to_observation -> preprocessor -> policy) is unchanged.
+        timed_observation.observation = decompress_observation_images(
+            timed_observation.get_observation()
+        )
+
         deserialize_time = time.perf_counter() - start_deserialize
 
         self.logger.debug(f"Received observation #{timed_observation.get_timestep()}")
@@ -428,6 +437,28 @@ def serve(cfg: PolicyServerConfig):
     server.add_insecure_port(f"{cfg.host}:{cfg.port}")
 
     policy_server.logger.info(f"PolicyServer started on {cfg.host}:{cfg.port}")
+
+    # SECURITY: SendObservations / SendPolicyInstructions deserialize incoming
+    # bytes with pickle.loads, which will execute arbitrary code embedded in a
+    # malicious payload. This server is only safe to run inside a trusted
+    # network (LAN / WireGuard / Tailscale / ZeroTier). Do NOT expose it to the
+    # public internet without an auth layer in front.
+    if cfg.host in ("0.0.0.0", "::", ""):
+        policy_server.logger.warning(
+            "SECURITY: PolicyServer is bound to a WILDCARD address (%s) and uses "
+            "pickle for the wire format. Any host that can reach port %d can run "
+            "arbitrary Python code on this machine. Run ONLY inside a trusted "
+            "network (VPN, LAN behind a firewall). Do not expose over ngrok or "
+            "the public internet without an authenticated tunnel.",
+            cfg.host,
+            cfg.port,
+        )
+    else:
+        policy_server.logger.warning(
+            "SECURITY: PolicyServer uses pickle for the wire format; only accept "
+            "connections from trusted clients."
+        )
+
     server.start()
 
     server.wait_for_termination()

@@ -138,6 +138,82 @@ class RobotClientConfig:
     fps: int = field(default=DEFAULT_FPS, metadata={"help": "Frames per second"})
     control_fps: int = field(default=60, metadata={"help": "Motor command frequency on the robot client"})
 
+    # YOLO safety detection configuration
+    yolo_enabled: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Enable the YOLO-based safety loop. When False, the safety thread and detector "
+                "are not constructed, and `ultralytics` is not imported."
+            )
+        },
+    )
+    yolo_visualize: bool = field(
+        default=False, metadata={"help": "Show safety camera with YOLO detection boxes"}
+    )
+    yolo_model_path: str = field(
+        default="yolo11n.pt",
+        metadata={"help": "Path to YOLO model used for safety detection"},
+    )
+    yolo_conf: float = field(default=0.5, metadata={"help": "YOLO confidence threshold"})
+    yolo_required_hits: int = field(
+        default=2,
+        metadata={"help": "Consecutive person detections required to trigger emergency stop"},
+    )
+    yolo_device: str = field(
+        default="cpu", metadata={"help": "Device used for YOLO safety detection"}
+    )
+    yolo_detect_every_n: int = field(
+        default=1,
+        metadata={"help": "Run YOLO once every N safety camera frames. 1 means every frame."},
+    )
+    safety_camera: str = field(
+        default="camera1",
+        metadata={"help": "Camera key in robot observation used for YOLO safety detection"},
+    )
+
+    # Observation compression (reduces network bandwidth between client and server).
+    # When enabled, the client resizes camera frames to (obs_target_height, obs_target_width)
+    # and JPEG-encodes them before sending. The server decodes on receive; the policy input
+    # is unchanged as long as the target shape matches the policy's image_features.
+    obs_compression_enabled: bool = field(
+        default=False,
+        metadata={"help": "Enable JPEG compression of camera frames before sending to server"},
+    )
+    obs_jpeg_quality: int = field(
+        default=90,
+        metadata={"help": "JPEG quality (1-100) when obs_compression_enabled is True"},
+    )
+    obs_target_height: int = field(
+        default=480,
+        metadata={"help": "Resize target height for camera frames before JPEG encoding"},
+    )
+    obs_target_width: int = field(
+        default=640,
+        metadata={"help": "Resize target width for camera frames before JPEG encoding"},
+    )
+
+    # Per-call gRPC deadline for SendObservations. Prevents a bad network from
+    # blocking the sender thread indefinitely. Timeout errors are logged and the
+    # frame is dropped; the main control loop is never blocked by network.
+    obs_send_timeout: float = field(
+        default=0.2,
+        metadata={"help": "Per-call SendObservations timeout in seconds (<=0 disables)"},
+    )
+
+    # Stale-action watchdog: if no fresh action chunk arrives for this long, the
+    # client flushes its buffer and holds position instead of running open-loop
+    # against stale visual context. Set <=0 to disable the watchdog.
+    stale_action_threshold: float = field(
+        default=0.5,
+        metadata={
+            "help": (
+                "Seconds without receiving a new action chunk before the client "
+                "flushes its action buffer and holds position (<=0 disables)"
+            )
+        },
+    )
+
     # Aggregate function configuration (CLI-compatible)
     aggregate_fn_name: str = field(
         default="weighted_average",
@@ -192,6 +268,24 @@ class RobotClientConfig:
         if self.actions_per_chunk <= 0:
             raise ValueError(f"actions_per_chunk must be positive, got {self.actions_per_chunk}")
 
+        if self.yolo_conf < 0 or self.yolo_conf > 1:
+            raise ValueError(f"yolo_conf must be between 0 and 1, got {self.yolo_conf}")
+
+        if self.yolo_required_hits <= 0:
+            raise ValueError(f"yolo_required_hits must be positive, got {self.yolo_required_hits}")
+
+        if self.yolo_detect_every_n <= 0:
+            raise ValueError(f"yolo_detect_every_n must be positive, got {self.yolo_detect_every_n}")
+
+        if not 1 <= self.obs_jpeg_quality <= 100:
+            raise ValueError(f"obs_jpeg_quality must be in [1, 100], got {self.obs_jpeg_quality}")
+
+        if self.obs_target_height <= 0 or self.obs_target_width <= 0:
+            raise ValueError(
+                f"obs_target_height/width must be positive, got "
+                f"({self.obs_target_height}, {self.obs_target_width})"
+            )
+
         self.aggregate_fn = get_aggregate_function(self.aggregate_fn_name)
 
     @classmethod
@@ -214,4 +308,18 @@ class RobotClientConfig:
             "task": self.task,
             "debug_visualize_queue_size": self.debug_visualize_queue_size,
             "aggregate_fn_name": self.aggregate_fn_name,
+            "yolo_enabled": self.yolo_enabled,
+            "yolo_visualize": self.yolo_visualize,
+            "yolo_model_path": self.yolo_model_path,
+            "yolo_conf": self.yolo_conf,
+            "yolo_required_hits": self.yolo_required_hits,
+            "yolo_device": self.yolo_device,
+            "yolo_detect_every_n": self.yolo_detect_every_n,
+            "safety_camera": self.safety_camera,
+            "obs_compression_enabled": self.obs_compression_enabled,
+            "obs_jpeg_quality": self.obs_jpeg_quality,
+            "obs_target_height": self.obs_target_height,
+            "obs_target_width": self.obs_target_width,
+            "obs_send_timeout": self.obs_send_timeout,
+            "stale_action_threshold": self.stale_action_threshold,
         }
